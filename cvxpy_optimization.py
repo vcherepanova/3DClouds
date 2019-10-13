@@ -3,9 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os, sys, math, signal, glob
 import open3d as o3d
-import torch
-from torch.autograd import Variable
-from functions import find_neighbors, loss, check_error
+import cvxpy as cp
+
+from functions import find_neighbors, loss, check_error_2
+
 
 if __name__ == '__main__':
     
@@ -16,12 +17,8 @@ if __name__ == '__main__':
     parser.add_argument('--z_scale', type=float, required=False, default=100)
     parser.add_argument('--num_fixed_points', type=int, required=False, default=20000)
     parser.add_argument('--num_points', type=int, required=False, default=100)
-    parser.add_argument('--lam', type=float, required=False, default=1)
     parser.add_argument('--num_neighbors', type=float, required=False, default=3)
     parser.add_argument('--window_size', type=float, required=False, default=1000)
-    parser.add_argument('--learning_rate', type=float, required=False, default=1)
-    parser.add_argument('--weight_decay', type=float, required=False, default=10**(-4))
-    parser.add_argument('--num_iter', type=float, required=False, default=10)
 
 
     args = parser.parse_args()
@@ -30,6 +27,7 @@ if __name__ == '__main__':
     z_start = args.z_start
     z_end = args.z_end
     z_scale = args.z_scale
+
 
 
     # Read the data
@@ -75,53 +73,79 @@ if __name__ == '__main__':
     pcd.points = o3d.utility.Vector3dVector(xyz)
     o3d.visualization.draw_geometries([pcd])
 
-
-
-
-    # parameters (number of fixed points, number of points to optimize,
-    # regularization parameter, number of neighbors and window size)
+    # Generate a random feasible SOCP.
     n_fixed = args.num_fixed_points
     n_points = args.num_points
-    lam = args.lam
     k_neigh = args.num_neighbors
     window_size = args.window_size
-    lr = args.learning_rate
-    wd = args.weight_decay
-    iterations = args.num_iter
-    
-    cloud_new = cloud_slice[0:n_fixed+n_points,[0,1,2]]
+    cloud_new = cloud_slice[:,[0,1,2]][0:n_fixed+n_points]
 
-    # plot points to optimize
-    xyz = np.dstack((cloud_new[:,1], cloud_new[:,2],cloud_new[:,0]))[0]
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz)
-    o3d.visualization.draw_geometries([pcd])
-
-
-    dtype = torch.cuda.FloatTensor
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    x = Variable(torch.from_numpy(cloud_new[n_fixed:])).to(device).detach().requires_grad_(True)
+    n_constr = n_points*3
+    p = 1
     N, D = find_neighbors(cloud_new, k_neigh, window_size, n_fixed)
 
+    # linear program with quadratic constraints    
+    f = -np.array([1,0,0]*n_points)
+    A = []
+    b = []
+    c = []
+    d = []
+    x0 = np.reshape(cloud_new[n_fixed:], (3*n_points,1))
+    for index, point in enumerate(cloud_new[n_fixed:]):
+        index_shifted = index+n_fixed
+        neighb_ind = N[index_shifted]
+        dist = D[index_shifted]
+        # for each neighbor point
+        for j in range(len(dist)):
+
+            # if the neighbor is a fixed point then constraint is the distance to it
+            if neighb_ind[j] < n_fixed:
+
+                A_new = np.zeros((3, 3*n_points))
+                A_new[0,3*index] = 1
+                A_new[1,3*index+1] = 1
+                A_new[2,3*index+2] = 1
+                b_new = -cloud_new[neighb_ind[j]]
+            else:
+
+                neighb_ind_var = neighb_ind[j] - n_fixed
+                A_new_1 = np.zeros((3, 3*n_points))
+                A_new_1[0,3*index] = 1
+                A_new_1[1,3*index+1] = 1
+                A_new_1[2,3*index+2] = 1
+                A_new_2 = np.zeros((3, 3*n_points))
+                A_new_2[0,3*neighb_ind_var] = 1
+                A_new_2[1,3*neighb_ind_var+1] = 1
+                A_new_2[2,3*neighb_ind_var+2] = 1
+                A_new = A_new_1-A_new_2
+                b_new = np.zeros(3)
+
+            A.append(A_new)
+            b.append(b_new)
+            c.append(np.zeros(3*n_points))
+            d.append(dist[j])  
+    F = np.random.randn(p, 3*n_points)
+    g = F@x0
 
 
-    optimizer = torch.optim.Adam([x], lr=lr, weight_decay = wd)
-    f_x = loss(cloud_new, x, N, D, n_fixed, lam)
-    print(x)
-    print(f_x)
-    for i in range(iterations):
-        f_x = loss(cloud_new, x, N, D, n_fixed, lam)
-        optimizer.zero_grad()
-        f_x.backward(retain_graph=True)
-        optimizer.step()
-        if (i + 1) % 100 == 0:
-            print(i + 1, x, f_x)
 
 
+    # Define and solve the CVXPY problem.
+    x = cp.Variable(3*n_points)
+    # We use cp.SOC(t, x) to create the SOC constraint ||x||_2 <= t.
+    soc_constraints = [cp.SOC(c[i].T@x + d[i], A[i]@x + b[i]) for i in range(k_neigh*n_points)
+    ]
+    prob = cp.Problem(cp.Minimize(f.T@x), soc_constraints + [F@x == g])
+    prob.solve()
+
+    # Print result.
+    print("The optimal value is", prob.value)
+    print("A solution x is")
+    print(x.value)
 
 
-    x_val = x.cpu().detach().numpy()
-    print('error:', check_error(cloud_new, x_val, N,D, n_fixed))
+    x_val = np.reshape(x.value, [n_points,3])
+    print('error:', check_error_2(cloud_new, x_val, N,D, n_fixed))
     # plot the points 
     cloud_optimized = cloud_new
     cloud_optimized[n_fixed:n_fixed+n_points] = x_val
@@ -130,4 +154,6 @@ if __name__ == '__main__':
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     o3d.visualization.draw_geometries([pcd])
+
+
 
