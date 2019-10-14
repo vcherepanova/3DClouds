@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,25 +11,24 @@ from functions import find_neighbors, loss, check_error_2
 
 
 if __name__ == '__main__':
-    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cl', type=str, default='seq_03.npz', required=True)
-    parser.add_argument('--z_start', type=float, required=False, default=0.3)
+    parser.add_argument('--cl', type=str, default='/home/ncos/Desktop/3d_dvs_datasets/simple/seq_03.npz', required=False)
+    parser.add_argument('--z_start', type=float, required=False, default=1.0)
     parser.add_argument('--z_end', type=float, required=False, default=1.5)
     parser.add_argument('--z_scale', type=float, required=False, default=100)
-    parser.add_argument('--num_fixed_points', type=int, required=False, default=20000)
-    parser.add_argument('--num_points', type=int, required=False, default=100)
-    parser.add_argument('--num_neighbors', type=float, required=False, default=3)
+
+    #parser.add_argument('--num_fixed_points', type=int, required=False, default=20000)
+    #parser.add_argument('--num_points', type=int, required=False, default=100)
+    parser.add_argument('--num_neighbors', type=float, required=False, default=16)
     parser.add_argument('--window_size', type=float, required=False, default=1000)
 
 
     args = parser.parse_args()
 
-    cl = 'seq_03.npz'
+    cl = args.cl
     z_start = args.z_start
     z_end = args.z_end
     z_scale = args.z_scale
-
 
 
     # Read the data
@@ -64,27 +65,33 @@ if __name__ == '__main__':
 
     # Chop off the array of interest
     cloud_slice = cloud[start_index : end_index]
+    cloud_slice[0, :] -= cloud_slice[0, 0]
     print ("Chopped event (point) count:", cloud_slice.shape[0])
+
+    # Generate a random? feasible SOCP.
+    n_fixed = idx[int((z_start + 0.01) / discretization)] - start_index   #args.num_fixed_points
+    n_points = idx[int((z_start + 0.025) / discretization)] - start_index - n_fixed  #args.num_points
+    k_neigh = args.num_neighbors
+    window_size = args.window_size
+    cloud_new = cloud_slice[:,[0,1,2]][0:n_fixed+n_points]
+    print ("Fixed / moving points:", n_fixed, n_points)
 
     # Convert to Open3D PCD
     # http://www.open3d.org/docs/release/tutorial/Basic/working_with_numpy.html
     xyz = np.dstack((cloud_slice[:,1], cloud_slice[:,2], cloud_slice[:,0]))[0]
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
+    np_colors = np.array([[1.0,0,0]] * xyz.shape[0])
+    np_colors[n_fixed:n_fixed + n_points] = np.array([0.0, 0.0, 1.0])
+    np_colors[n_fixed + n_points:] = np.array([0.0, 0.0, 0.0])
+    pcd.colors = o3d.utility.Vector3dVector(np_colors)
     o3d.visualization.draw_geometries([pcd])
 
-    # Generate a random feasible SOCP.
-    n_fixed = args.num_fixed_points
-    n_points = args.num_points
-    k_neigh = args.num_neighbors
-    window_size = args.window_size
-    cloud_new = cloud_slice[:,[0,1,2]][0:n_fixed+n_points]
-
-    n_constr = n_points*3
+    n_constr = n_points * 3
     p = 1
     N, D = find_neighbors(cloud_new, k_neigh, window_size, n_fixed)
 
-    # linear program with quadratic constraints    
+    # linear program with quadratic constraints
     f = -np.array([1,0,0]*n_points)
     A = []
     b = []
@@ -123,11 +130,9 @@ if __name__ == '__main__':
             A.append(A_new)
             b.append(b_new)
             c.append(np.zeros(3*n_points))
-            d.append(dist[j])  
+            d.append(dist[j])
     F = np.random.randn(p, 3*n_points)
     g = F@x0
-
-
 
 
     # Define and solve the CVXPY problem.
@@ -143,10 +148,9 @@ if __name__ == '__main__':
     print("A solution x is")
     print(x.value)
 
-
     x_val = np.reshape(x.value, [n_points,3])
     print('error:', check_error_2(cloud_new, x_val, N,D, n_fixed))
-    # plot the points 
+    # plot the points
     cloud_optimized = cloud_new
     cloud_optimized[n_fixed:n_fixed+n_points] = x_val
     xyz = np.dstack((cloud_optimized[:,1], cloud_optimized[:,2],
@@ -154,6 +158,3 @@ if __name__ == '__main__':
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     o3d.visualization.draw_geometries([pcd])
-
-
-
